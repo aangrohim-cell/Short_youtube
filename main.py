@@ -6,143 +6,132 @@ from datetime import datetime
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
-# =========================
-# KONFIG
-# =========================
-FOLDER_ID = "1nKSO2v_YWZn1EE1HMvEP_rM9EqrHkQV2"  # Folder Google Drive kamu
-LOCAL_VIDEO = "video.mp4"
-TOKEN_FILE = "token.json"
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
 
+# ================== KONFIG ==================
+FOLDER_ID = "1nKSO2v_YWZn1EE1HMvEP_rM9EqrHkQV2"  # folder Drive kamu
 SCOPES = [
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/youtube.upload"
 ]
+# ============================================
 
-# =========================
-# LOGIN GOOGLE
-# =========================
 def get_credentials():
     creds = None
 
-    # Load token jika ada
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "rb") as token:
-            creds = pickle.load(token)
+    # Load token.json jika ada
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
-    # Kalau belum ada / expired
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print("🔁 Refresh token...")
-            creds.refresh(Request())
-        else:
-            print("🌐 Login Google diperlukan...")
+    # Jika token invalid, refresh
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
 
-            # Ambil client secrets dari ENV (GitHub Secrets)
-            if "CLIENT_SECRETS_JSON" in os.environ:
-                client_config = json.loads(os.environ["CLIENT_SECRETS_JSON"])
-                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-            else:
-                # Fallback lokal (kalau masih ada file)
-                flow = InstalledAppFlow.from_client_secrets_file("client_secrets.json", SCOPES)
+    # Jika belum ada token, buat dari SECRET
+    if not creds:
+        print("❌ token.json tidak ditemukan / invalid")
+        print("➡️ Pastikan token.json sudah diupload ke repo GitHub")
+        exit(1)
 
-            creds = flow.run_local_server(port=0)
-
-        # Simpan token
-        with open(TOKEN_FILE, "wb") as token:
-            pickle.dump(creds, token)
-
-    print("✅ Login Google OK")
     return creds
 
-# =========================
-# MAIN
-# =========================
-def main():
-    creds = get_credentials()
+def get_drive():
+    gauth = GoogleAuth()
 
-    drive_service = build("drive", "v3", credentials=creds)
-    youtube_service = build("youtube", "v3", credentials=creds)
+    # Pakai token.json
+    gauth.LoadCredentialsFile("token.json")
+    if gauth.credentials is None:
+        print("❌ token.json tidak valid")
+        exit(1)
+    elif gauth.access_token_expired:
+        gauth.Refresh()
+    else:
+        gauth.Authorize()
 
+    gauth.SaveCredentialsFile("token.json")
+    return GoogleDrive(gauth)
+
+def get_youtube(creds):
+    return build("youtube", "v3", credentials=creds)
+
+def get_oldest_video(drive):
     print("🔍 Mengecek folder Drive...")
 
-    # Ambil video tertua (FIFO)
-    results = drive_service.files().list(
-        q=f"'{FOLDER_ID}' in parents and trashed=false",
-        orderBy="createdTime",
-        fields="files(id, name, createdTime)"
-    ).execute()
+    file_list = drive.ListFile({
+        "q": f"'{FOLDER_ID}' in parents and trashed=false",
+        "orderBy": "createdDate asc"
+    }).GetList()
 
-    items = results.get("files", [])
+    if not file_list:
+        print("📭 Tidak ada video di Drive.")
+        return None
 
-    if not items:
-        print("📭 Folder kosong. Tidak ada video untuk diupload.")
-        return
+    return file_list[0]
 
-    video = items[0]
-    print("📥 Mengambil:", video["name"])
+def download_file(file):
+    print(f"⬇️ Mengambil: {file['title']}")
 
-    # =========================
-    # DOWNLOAD FILE
-    # =========================
-    request = drive_service.files().get_media(fileId=video["id"])
+    file.GetContentFile("video.mp4")
+    return "video.mp4", file["title"]
 
-    with open(LOCAL_VIDEO, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-
-    print("💾 Download selesai")
-
-    # =========================
-    # UPLOAD KE YOUTUBE
-    # =========================
+def upload_youtube(youtube, filepath, title):
     print("🚀 Upload ke YouTube...")
 
-    request = youtube_service.videos().insert(
-        part="snippet,status",
-        body={
-            "snippet": {
-                "title": video["name"],  # Judul = nama file
-                "description": "#shorts",
-                "categoryId": "22"
-            },
-            "status": {
-                "privacyStatus": "public"
-            }
+    body = {
+        "snippet": {
+            "title": os.path.splitext(title)[0],
+            "description": "",
+            "tags": ["shorts"],
+            "categoryId": "22"
         },
-        media_body=MediaFileUpload(LOCAL_VIDEO, resumable=True)
+        "status": {
+            "privacyStatus": "public"
+        }
+    }
+
+    media = MediaFileUpload(filepath, chunksize=-1, resumable=True)
+
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media
     )
 
-    response = request.execute()
-    print("✅ Upload sukses! Video ID:", response["id"])
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
 
-    # =========================
-    # HAPUS DARI DRIVE
-    # =========================
-    drive_service.files().delete(fileId=video["id"]).execute()
-    print("🗑️ Video dihapus dari Drive")
+    print("✅ Upload sukses:", response["id"])
 
-    # =========================
-    # HAPUS FILE LOKAL
-    # =========================
+def main():
+    print("🔑 Login Google OK")
+
+    creds = get_credentials()
+    drive = get_drive()
+    youtube = get_youtube(creds)
+
+    file = get_oldest_video(drive)
+    if not file:
+        print("⏭️ Tidak ada video, skip.")
+        return
+
+    path, title = download_file(file)
+    upload_youtube(youtube, path, title)
+
+    print("🗑️ Hapus video dari Drive...")
+    file.Delete()
+
     try:
-        os.remove(LOCAL_VIDEO)
-        print("🧹 File lokal dihapus")
+        os.remove(path)
     except:
-        print("⚠️ Gagal hapus file lokal, tapi tidak masalah.")
+        pass
 
-    print("🎉 Selesai 1 video.")
+    print("🎉 SELESAI")
 
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("❌ ERROR:", str(e))
-        raise
+    main()
